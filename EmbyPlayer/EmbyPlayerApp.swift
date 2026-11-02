@@ -49,6 +49,20 @@ struct EmbyItemsResponse: Decodable {
     var TotalRecordCount: Int?
 }
 
+// Plozz 开源写法：先问服务器 PlaybackInfo，由服务器决定直出还是转码，
+// 再用服务器返回的 TranscodingUrl / 直出地址播，不再自己硬拼 master.m3u8。
+struct PlaybackInfoResponse: Decodable {
+    var PlaySessionId: String?
+    var MediaSources: [MediaSourceInfo]?
+}
+
+struct MediaSourceInfo: Decodable {
+    var Id: String?
+    var Container: String?
+    var ETag: String?
+    var TranscodingUrl: String?
+}
+
 struct EmbyUser: Decodable {
     var Id: String
     var Name: String?
@@ -134,6 +148,8 @@ final class Store: ObservableObject {
     @Published var isLoading = false
     @Published var playing: PlayItem?
     @Published var player: AVPlayer?
+    @Published var tab: Tab = .home
+    @Published var closeBrowse = false
     @Published var danmaku: [DanmakuItem] = []
     @Published var danmakuOn = true
     @Published var servers: [EmbyServer] = []
@@ -432,10 +448,55 @@ final class Store: ObservableObject {
     }
 
     func playEmby(_ item: EmbyItem) {
-        if let u = streamURL(for: item) {
-            let kw = (item.SeriesName?.isEmpty == false ? item.SeriesName! : (item.Name ?? item.displayName))
-            let dur = item.RunTimeTicks.map { Double($0) / 10_000_000 } ?? 0
-            play(url: u.absoluteString, title: item.displayName, source: "Emby", searchTitle: kw, duration: dur)
+        Task { await playEmbyAsync(item) }
+    }
+
+    // Plozz 式播放：POST PlaybackInfo 让服务器选源。
+    // Emby 把空限制当成严格限制，所以 MaxStreamingBitrate 给 Int64 最大值（Plozz 同款处理）。
+    // 拿到 TranscodingUrl 就走转码/重封装地址；没有就走直出 stream；问服务器失败才回退旧地址。
+    func playEmbyAsync(_ item: EmbyItem) async {
+        let kw = (item.SeriesName?.isEmpty == false ? item.SeriesName! : (item.Name ?? item.displayName))
+        let dur = item.RunTimeTicks.map { Double($0) / 10_000_000 } ?? 0
+        var finalURL: String?
+        do {
+            guard let url = URL(string: cleanServer + "/Items/\(item.Id)/PlaybackInfo?UserId=\(userId)") else { throw URLError(.badURL) }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue(authHeader(includeToken: true), forHTTPHeaderField: "X-Emby-Authorization")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: [
+                "UserId": userId,
+                "MaxStreamingBitrate": 9223372036854775807,
+                "EnableDirectPlay": true,
+                "EnableDirectStream": true,
+                "EnableTranscoding": true
+            ])
+            let (data, _) = try await URLSession.shared.data(for: req)
+            let info = try JSONDecoder().decode(PlaybackInfoResponse.self, from: data)
+            if let src = info.MediaSources?.first {
+                if let t = src.TranscodingUrl, !t.isEmpty {
+                    // 服务器给的可能是相对地址，拼上服务器域名；没带 api_key 就补一个。
+                    var full = t.hasPrefix("http") ? t : cleanServer + (t.hasPrefix("/") ? t : "/" + t)
+                    if !full.lowercased().contains("api_key=") {
+                        full += (full.contains("?") ? "&" : "?") + "api_key=\(token)"
+                    }
+                    finalURL = full
+                } else {
+                    let container = src.Container ?? "mp4"
+                    let sid = src.Id ?? item.Id
+                    finalURL = cleanServer + "/Videos/\(item.Id)/stream.\(container)?static=true&mediaSourceId=\(sid)&api_key=\(token)"
+                }
+            }
+        } catch {
+            finalURL = nil
+        }
+        if finalURL == nil, let u = streamURL(for: item) {
+            finalURL = u.absoluteString
+        }
+        if let f = finalURL {
+            play(url: f, title: item.displayName, source: "Emby", searchTitle: kw, duration: dur)
+        } else {
+            errorMessage = "这部拿不到播放地址，服务器没返回可用源"
         }
     }
 
@@ -653,14 +714,13 @@ enum Tab: String, CaseIterable {
 
 struct ContentView: View {
     @EnvironmentObject var store: Store
-    @State private var tab: Tab = .home
     @State private var showDocPicker = false
     @State private var showSearch = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
             Group {
-                switch tab {
+                switch store.tab {
                 case .home: HomeView()
                 case .library: LibraryView(showDocPicker: $showDocPicker)
                 case .history: HistoryView()
@@ -674,17 +734,17 @@ struct ContentView: View {
             HStack(spacing: 0) {
                 ForEach(Tab.allCases, id: \.self) { t in
                     Button {
-                        withAnimation(.easeInOut(duration: 0.25)) { tab = t }
+                        withAnimation(.easeInOut(duration: 0.25)) { store.tab = t }
                     } label: {
                         VStack(spacing: 4) {
                             Image(systemName: t.icon)
                                 .font(.system(size: 20, weight: .semibold))
                             Text(t.title).font(.system(size: 11))
                         }
-                        .foregroundStyle(tab == t ? .black : .gray)
+                        .foregroundStyle(store.tab == t ? .black : .gray)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
-                        .background(tab == t ? Color.black.opacity(0.06) : Color.clear)
+                        .background(store.tab == t ? Color.black.opacity(0.06) : Color.clear)
                         .clipShape(Capsule())
                     }
                 }
@@ -757,7 +817,7 @@ struct PosterCard: View {
             .shadow(color: .black.opacity(0.06), radius: 4, y: 2)
             Text(item.displayName).font(.system(size: 13)).lineLimit(1).foregroundStyle(.black)
             if let y = item.ProductionYear {
-                Text("\(y)").font(.system(size: 12)).foregroundStyle(.gray)
+                Text(String(y)).font(.system(size: 12)).foregroundStyle(.gray)
             }
         }
         .frame(width: width, alignment: .leading)
@@ -953,6 +1013,9 @@ struct HomeView: View {
                     .toolbar { Button("关闭") { showBrowse = false } }
                 }
             }
+            .onChange(of: store.closeBrowse) { v in
+                if v { showBrowse = false }
+            }
         }
     }
 }
@@ -964,6 +1027,16 @@ struct ItemDetailView: View {
     @Environment(\.dismiss) var dismiss
     var item: EmbyItem
     var seriesName: String { item.SeriesName ?? item.Name ?? item.displayName }
+    // 弹窗里直接起播放会被上层弹窗挡住：先关详情、关掉可能的上层片库弹窗，
+    // 等弹窗落下后再起播，播放器才能正常弹出来。
+    func playAndClose(_ it: EmbyItem) {
+        store.closeBrowse = true
+        dismiss()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            store.closeBrowse = false
+            store.playEmby(it)
+        }
+    }
     var episodes: [EmbyItem] {
         store.embyItems.filter { $0.SeriesName == seriesName }
             .sorted {
@@ -995,8 +1068,7 @@ struct ItemDetailView: View {
                         if !item.metaLine.isEmpty { Text(item.metaLine).foregroundStyle(.secondary) }
                         if let ov = item.Overview, !ov.isEmpty { Text(ov) }
                         Button {
-                            store.playEmby(item)
-                            dismiss()
+                            playAndClose(item)
                         } label: {
                             Label("播放", systemImage: "play.fill")
                                 .font(.headline).foregroundStyle(.white)
@@ -1007,8 +1079,7 @@ struct ItemDetailView: View {
                             Text("选集（\(episodes.count) 集）").font(.headline).padding(.top, 8)
                             ForEach(episodes) { ep in
                                 Button {
-                                    store.playEmby(ep)
-                                    dismiss()
+                                    playAndClose(ep)
                                 } label: {
                                     HStack {
                                         Text(ep.displayName).foregroundStyle(.black)
@@ -1075,8 +1146,9 @@ struct LibraryView: View {
                                             store.servers.remove(at: i); store.saveServers()
                                         }
                                     } else {
+                                        // 点服务器卡 = 进这个服务器里面：切服务器并回到发现页。
                                         store.switchServer(s)
-                                        showEmby = true
+                                        store.tab = .home
                                     }
                                 } label: {
                                     VStack(alignment: .leading, spacing: 8) {
@@ -1214,7 +1286,7 @@ struct EmbyGrid: View {
                         .shadow(color: .black.opacity(0.06), radius: 4, y: 2)
                         Text(item.displayName).font(.footnote).lineLimit(1).foregroundStyle(.black)
                         if let y = item.ProductionYear {
-                            Text("\(y)").font(.caption).foregroundStyle(.gray)
+                            Text(String(y)).font(.caption).foregroundStyle(.gray)
                         }
                     }
                 }
@@ -1255,7 +1327,10 @@ struct IPTVView: View {
                     Section(g) {
                         ForEach(filtered.filter { $0.group == g }) { ch in
                             Button {
-                                store.play(url: ch.url, title: ch.name, source: "IPTV")
+                                dismiss()
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                    store.play(url: ch.url, title: ch.name, source: "IPTV")
+                                }
                             } label: {
                                 HStack {
                                     Text(ch.name)
@@ -1288,8 +1363,11 @@ struct NetLinkView: View {
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
                 Button("播放") {
-                    store.play(url: store.netURL, title: "网络链接", source: "网络链接")
+                    let u = store.netURL
                     dismiss()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        store.play(url: u, title: "网络链接", source: "网络链接")
+                    }
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(store.netURL.isEmpty)
@@ -1607,12 +1685,18 @@ struct SearchView: View {
                         Text("没结果，先登录 Emby 或换个词。").foregroundStyle(.secondary)
                     }
                     ForEach(store.embyItems) { item in
-                        Button(item.displayName) { store.playEmby(item) }
+                        Button(item.displayName) {
+                            dismiss()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { store.playEmby(item) }
+                        }
                     }
                 }
                 Section("IPTV") {
                     ForEach(iptvHits) { ch in
-                        Button(ch.name) { store.play(url: ch.url, title: ch.name, source: "IPTV") }
+                        Button(ch.name) {
+                            dismiss()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { store.play(url: ch.url, title: ch.name, source: "IPTV") }
+                        }
                     }
                 }
             }
