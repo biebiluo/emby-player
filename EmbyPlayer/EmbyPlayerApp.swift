@@ -10,12 +10,24 @@ struct EmbyItem: Identifiable, Decodable {
     var Name: String?
     var `Type`: String?
     var SeriesName: String?
+    var SeriesId: String?
     var SeasonName: String?
     var IndexNumber: Int?
     var ParentIndexNumber: Int?
     var Overview: String?
     var RunTimeTicks: Int64?
+    var ProductionYear: Int?
+    var Genres: [String]?
+    var CommunityRating: Double?
+    var DateCreated: String?
     var id: String { Id }
+    var metaLine: String {
+        var parts: [String] = []
+        if let y = ProductionYear { parts.append("\(y)") }
+        if let g = Genres?.first { parts.append(g) }
+        if let r = CommunityRating { parts.append(String(format: "%.1f", r)) }
+        return parts.joined(separator: " · ")
+    }
     var displayName: String {
         if let s = SeriesName, !s.isEmpty {
             if let season = ParentIndexNumber, let ep = IndexNumber {
@@ -61,6 +73,11 @@ struct HistoryItem: Identifiable, Codable {
     var source: String
     var position: Double
     var updated: Date
+    var duration: Double?
+    var progress: Double {
+        guard let d = duration, d > 0 else { return 0 }
+        return min(max(position / d, 0), 1)
+    }
 }
 
 struct PlayItem: Identifiable {
@@ -69,6 +86,7 @@ struct PlayItem: Identifiable {
     var url: String
     var source: String
     var searchTitle: String
+    var duration: Double
 }
 
 struct DanmakuItem: Identifiable {
@@ -306,7 +324,7 @@ final class Store: ObservableObject {
 
     func loadEmbyItems() async {
         guard loggedIn else { return }
-        let q = "Recursive=true&IncludeItemTypes=Movie,Episode&SortBy=SortName&SortOrder=Ascending&Fields=Overview,RunTimeTicks,SeriesName,ParentIndexNumber,IndexNumber&Limit=300"
+        let q = "Recursive=true&IncludeItemTypes=Movie,Episode&SortBy=SortName&SortOrder=Ascending&Fields=Overview,RunTimeTicks,SeriesName,SeriesId,ParentIndexNumber,IndexNumber,ProductionYear,Genres,CommunityRating,DateCreated&Limit=300"
         guard let url = URL(string: cleanServer + "/Users/\(userId)/Items?\(q)") else { return }
         var req = URLRequest(url: url)
         req.setValue(authHeader(includeToken: true), forHTTPHeaderField: "X-Emby-Authorization")
@@ -339,6 +357,11 @@ final class Store: ObservableObject {
     func posterURL(for item: EmbyItem) -> URL? {
         guard loggedIn else { return nil }
         return URL(string: cleanServer + "/Items/\(item.Id)/Images/Primary?maxWidth=400&api_key=\(token)")
+    }
+
+    func backdropURL(for item: EmbyItem) -> URL? {
+        guard loggedIn else { return nil }
+        return URL(string: cleanServer + "/Items/\(item.Id)/Images/Backdrop/0?maxWidth=1200&api_key=\(token)")
     }
 
     func streamURL(for item: EmbyItem) -> URL? {
@@ -394,14 +417,14 @@ final class Store: ObservableObject {
         return out
     }
 
-    func play(url: String, title: String, source: String, searchTitle: String? = nil) {
+    func play(url: String, title: String, source: String, searchTitle: String? = nil, duration: Double = 0) {
         guard let u = URL(string: url) else {
             errorMessage = "这个播放地址打不开"
             return
         }
         let p = AVPlayer(url: u)
         player = p
-        playing = PlayItem(id: UUID().uuidString, title: title, url: url, source: source, searchTitle: searchTitle ?? title)
+        playing = PlayItem(id: UUID().uuidString, title: title, url: url, source: source, searchTitle: searchTitle ?? title, duration: duration)
         danmaku = []
         subtitles = []
         p.play()
@@ -411,7 +434,8 @@ final class Store: ObservableObject {
     func playEmby(_ item: EmbyItem) {
         if let u = streamURL(for: item) {
             let kw = (item.SeriesName?.isEmpty == false ? item.SeriesName! : (item.Name ?? item.displayName))
-            play(url: u.absoluteString, title: item.displayName, source: "Emby", searchTitle: kw)
+            let dur = item.RunTimeTicks.map { Double($0) / 10_000_000 } ?? 0
+            play(url: u.absoluteString, title: item.displayName, source: "Emby", searchTitle: kw, duration: dur)
         }
     }
 
@@ -548,7 +572,7 @@ final class Store: ObservableObject {
         if let p = player, let cur = playing {
             let pos = p.currentTime().seconds
             if pos.isFinite && pos > 5 {
-                upsertHistory(title: cur.title, url: cur.url, source: cur.source, position: pos)
+                upsertHistory(title: cur.title, url: cur.url, source: cur.source, position: pos, duration: cur.duration > 0 ? cur.duration : nil)
             }
         }
         player?.pause()
@@ -556,12 +580,13 @@ final class Store: ObservableObject {
         playing = nil
     }
 
-    func upsertHistory(title: String, url: String, source: String, position: Double) {
+    func upsertHistory(title: String, url: String, source: String, position: Double, duration: Double? = nil) {
         if let i = history.firstIndex(where: { $0.url == url }) {
             history[i].position = position
             history[i].updated = Date()
+            if let d = duration { history[i].duration = d }
         } else {
-            history.append(HistoryItem(id: UUID().uuidString, title: title, url: url, source: source, position: position, updated: Date()))
+            history.append(HistoryItem(id: UUID().uuidString, title: title, url: url, source: source, position: position, updated: Date(), duration: duration))
         }
         history.sort { $0.updated > $1.updated }
         saveHistory()
@@ -607,31 +632,30 @@ struct EmbyPlayerApp: App {
 }
 
 enum Tab: String, CaseIterable {
-    case home, library, history, settings, search
+    case home, history, library, settings
     var title: String {
         switch self {
-        case .home: return "首页"
+        case .home: return "发现"
+        case .history: return "我的"
         case .library: return "资源库"
-        case .history: return "记录"
         case .settings: return "设置"
-        case .search: return "搜索"
         }
     }
     var icon: String {
         switch self {
-        case .home: return "play.rectangle.fill"
-        case .library: return "internaldrive.fill"
+        case .home: return "sparkles"
         case .history: return "person.fill"
+        case .library: return "internaldrive.fill"
         case .settings: return "gearshape.fill"
-        case .search: return "magnifyingglass"
         }
     }
 }
 
 struct ContentView: View {
     @EnvironmentObject var store: Store
-    @State private var tab: Tab = .library
+    @State private var tab: Tab = .home
     @State private var showDocPicker = false
+    @State private var showSearch = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -641,11 +665,11 @@ struct ContentView: View {
                 case .library: LibraryView(showDocPicker: $showDocPicker)
                 case .history: HistoryView()
                 case .settings: SettingsView()
-                case .search: SearchView()
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(.bottom, 84)
+            .background(Color(red: 0.96, green: 0.95, blue: 0.99))
 
             HStack(spacing: 0) {
                 ForEach(Tab.allCases, id: \.self) { t in
@@ -657,21 +681,32 @@ struct ContentView: View {
                                 .font(.system(size: 20, weight: .semibold))
                             Text(t.title).font(.system(size: 11))
                         }
-                        .foregroundStyle(tab == t ? .blue : .black)
+                        .foregroundStyle(tab == t ? .black : .gray)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
-                        .background(tab == t ? Color.blue.opacity(0.12) : Color.clear)
+                        .background(tab == t ? Color.black.opacity(0.06) : Color.clear)
                         .clipShape(Capsule())
                     }
                 }
+                Button { showSearch = true } label: {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(.black)
+                        .frame(width: 44, height: 44)
+                        .background(Color.white)
+                        .clipShape(Circle())
+                        .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+                }
+                .padding(.trailing, 4)
             }
             .padding(8)
-            .background(Color.white)
+            .background(Color.white.opacity(0.92))
             .clipShape(Capsule())
             .shadow(color: .black.opacity(0.12), radius: 12, y: 4)
             .padding(.horizontal, 16)
             .padding(.bottom, 10)
         }
+        .sheet(isPresented: $showSearch) { SearchView() }
         .sheet(isPresented: $showDocPicker) {
             DocumentPicker { url in
                 store.play(url: url.absoluteString, title: url.lastPathComponent, source: "本地文件")
@@ -683,64 +718,318 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Home
+// MARK: - Home (Rex-style Discover)
+
+struct SectionHeader: View {
+    var title: String
+    var action: () -> Void = {}
+    var body: some View {
+        Button(action: action) {
+            HStack {
+                Text(title).font(.system(size: 20, weight: .bold)).foregroundStyle(.black)
+                Spacer()
+                Image(systemName: "chevron.right").foregroundStyle(.gray)
+            }
+        }
+        .padding(.horizontal)
+    }
+}
+
+struct PosterCard: View {
+    @EnvironmentObject var store: Store
+    var item: EmbyItem
+    var width: CGFloat = 110
+    var height: CGFloat = 165
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 14).fill(Color.white)
+                if let u = store.posterURL(for: item) {
+                    AsyncImage(url: u) { img in
+                        img.resizable().scaledToFill()
+                    } placeholder: {
+                        VStack { Image(systemName: "photo").foregroundStyle(.gray); Text(item.displayName).font(.caption).foregroundStyle(.gray).lineLimit(2).multilineTextAlignment(.center).padding(6) }
+                    }
+                }
+            }
+            .frame(width: width, height: height)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .shadow(color: .black.opacity(0.06), radius: 4, y: 2)
+            Text(item.displayName).font(.system(size: 13)).lineLimit(1).foregroundStyle(.black)
+            if let y = item.ProductionYear {
+                Text("\(y)").font(.system(size: 12)).foregroundStyle(.gray)
+            }
+        }
+        .frame(width: width, alignment: .leading)
+    }
+}
 
 struct HomeView: View {
     @EnvironmentObject var store: Store
+    @State private var detailItem: EmbyItem?
+    @State private var browseTitle = ""
+    @State private var browseItems: [EmbyItem] = []
+    @State private var showBrowse = false
+
+    var movies: [EmbyItem] { store.embyItems.filter { $0.Type == "Movie" } }
+    var seriesReps: [EmbyItem] {
+        var seen: [String] = []
+        var out: [EmbyItem] = []
+        for item in store.embyItems where item.SeriesName != nil {
+            let key = item.SeriesName!
+            if !seen.contains(key) { seen.append(key); out.append(item) }
+        }
+        return out
+    }
+    var recent: [EmbyItem] {
+        store.embyItems.sorted { ($0.DateCreated ?? "") > ($1.DateCreated ?? "") }
+    }
+    var heroItems: [EmbyItem] { Array(movies.prefix(5)) }
+
+    func openBrowse(title: String, items: [EmbyItem]) {
+        browseTitle = title; browseItems = items; showBrowse = true
+    }
+    func timeText(_ seconds: Double) -> String {
+        let m = Int(seconds) / 60; let s = Int(seconds) % 60
+        return String(format: "%02d:%02d", m, s)
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    Text("当前：\(store.activeProfileName)").font(.footnote).foregroundStyle(.secondary)
-                    if !store.followNotice.isEmpty {
-                        Text(store.followNotice).font(.footnote).foregroundStyle(.blue)
-                    }
-                    Text("继续观看").font(.title2.bold())
-                    if store.history.isEmpty {
-                        Text("还没有观看记录，从资源库挑一部开始看。")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(store.history.prefix(10)) { h in
-                            Button {
-                                store.play(url: h.url, title: h.title, source: h.source)
-                                if let p = store.player {
-                                    p.seek(to: CMTime(seconds: h.position, preferredTimescale: 600))
-                                }
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading) {
-                                        Text(h.title).font(.headline).foregroundStyle(.black)
-                                        Text("\(h.source) · 已看到 \(Int(h.position / 60)) 分钟")
-                                            .font(.footnote).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 24) {
+                    // Hero 轮播：大海报 + 渐变 + 标题简介，跟 Rex 首页顶部一样。
+                    if !heroItems.isEmpty {
+                        TabView {
+                            ForEach(heroItems) { item in
+                                Button { detailItem = item } label: {
+                                    ZStack(alignment: .bottomLeading) {
+                                        if let u = store.backdropURL(for: item) {
+                                            AsyncImage(url: u) { img in img.resizable().scaledToFill() } placeholder: {
+                                                if let p = store.posterURL(for: item) {
+                                                    AsyncImage(url: p) { img in img.resizable().scaledToFill() } placeholder: { Color.gray.opacity(0.2) }
+                                                } else { Color.gray.opacity(0.2) }
+                                            }
+                                        } else if let p = store.posterURL(for: item) {
+                                            AsyncImage(url: p) { img in img.resizable().scaledToFill() } placeholder: { Color.gray.opacity(0.2) }
+                                        } else {
+                                            Color.gray.opacity(0.2)
+                                        }
+                                        LinearGradient(colors: [.clear, .black.opacity(0.75)], startPoint: .top, endPoint: .bottom)
+                                        VStack(alignment: .leading, spacing: 6) {
+                                            Text(item.displayName).font(.system(size: 26, weight: .bold)).foregroundStyle(.white).lineLimit(1)
+                                            if !item.metaLine.isEmpty {
+                                                Text(item.metaLine).font(.subheadline).foregroundStyle(.white.opacity(0.85))
+                                            }
+                                            if let ov = item.Overview, !ov.isEmpty {
+                                                Text(ov).font(.footnote).foregroundStyle(.white.opacity(0.85)).lineLimit(2)
+                                            }
+                                            HStack {
+                                                Label("播放", systemImage: "play.fill")
+                                                    .font(.headline).foregroundStyle(.black)
+                                                    .padding(.horizontal, 18).padding(.vertical, 8)
+                                                    .background(Color.white).clipShape(Capsule())
+                                            }
+                                            .padding(.top, 4)
+                                        }
+                                        .padding()
+                                        .padding(.bottom, 20)
                                     }
-                                    Spacer()
-                                    Image(systemName: "play.circle.fill").font(.title2)
                                 }
-                                .padding()
-                                .background(Color.gray.opacity(0.08))
-                                .clipShape(RoundedRectangle(cornerRadius: 14))
+                                .buttonStyle(.plain)
                             }
                         }
+                        .frame(height: 420)
+                        .tabViewStyle(.page)
+                        .clipShape(RoundedRectangle(cornerRadius: 0))
+                    } else if !store.loggedIn {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("还没连 Emby").font(.title2.bold())
+                            Text("去“设置”里填服务器地址和账号，登录后这里就是海报墙。").foregroundStyle(.secondary)
+                        }
+                        .padding()
                     }
-                    if store.loggedIn {
-                        Text("Emby 片库（\(store.embyItems.count)）").font(.title2.bold())
-                        EmbyGrid(items: Array(store.embyItems.prefix(20)))
-                    } else {
-                        Text("还没连 Emby，去“设置”里填服务器地址和账号就能看。")
-                            .foregroundStyle(.secondary)
+
+                    if !store.followNotice.isEmpty {
+                        Text(store.followNotice).font(.footnote).foregroundStyle(.blue).padding(.horizontal)
+                    }
+
+                    // 继续观看：横滑大卡 + 看到几分几秒 + 进度条。
+                    if !store.history.isEmpty {
+                        SectionHeader(title: "继续观看") { }
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 14) {
+                                ForEach(store.history.prefix(10)) { h in
+                                    Button {
+                                        store.play(url: h.url, title: h.title, source: h.source)
+                                        if let p = store.player {
+                                            p.seek(to: CMTime(seconds: h.position, preferredTimescale: 600))
+                                        }
+                                    } label: {
+                                        VStack(alignment: .leading, spacing: 6) {
+                                            ZStack(alignment: .bottomLeading) {
+                                                RoundedRectangle(cornerRadius: 14).fill(Color.gray.opacity(0.15))
+                                                    .frame(width: 280, height: 158)
+                                                VStack(alignment: .leading, spacing: 4) {
+                                                    Text("看到 \(timeText(h.position))").font(.footnote).foregroundStyle(.white).shadow(radius: 2)
+                                                    if h.progress > 0 {
+                                                        GeometryReader { geo in
+                                                            ZStack(alignment: .leading) {
+                                                                Capsule().fill(Color.white.opacity(0.4)).frame(height: 4)
+                                                                Capsule().fill(Color.white).frame(width: geo.size.width * h.progress, height: 4)
+                                                            }
+                                                        }
+                                                        .frame(height: 4)
+                                                    }
+                                                }
+                                                .padding(10)
+                                            }
+                                            Text(h.title).font(.system(size: 14)).lineLimit(1).foregroundStyle(.black)
+                                            Text("\(h.source) · \(timeText(h.position))").font(.footnote).foregroundStyle(.gray)
+                                        }
+                                        .frame(width: 280, alignment: .leading)
+                                    }
+                                }
+                            }
+                            .padding(.horizontal)
+                        }
+                    }
+
+                    if !movies.isEmpty {
+                        SectionHeader(title: "电影") { openBrowse(title: "电影", items: movies) }
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 12) {
+                                ForEach(movies) { item in
+                                    Button { detailItem = item } label: { PosterCard(item: item) }
+                                        .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.horizontal)
+                        }
+                    }
+
+                    if !seriesReps.isEmpty {
+                        SectionHeader(title: "剧集") { openBrowse(title: "剧集", items: seriesReps) }
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 12) {
+                                ForEach(seriesReps) { item in
+                                    Button { detailItem = item } label: { PosterCard(item: item) }
+                                        .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.horizontal)
+                        }
+                    }
+
+                    if !recent.isEmpty {
+                        SectionHeader(title: "最近更新") { openBrowse(title: "最近更新", items: Array(recent.prefix(30))) }
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 12) {
+                                ForEach(Array(recent.prefix(20))) { item in
+                                    Button { detailItem = item } label: { PosterCard(item: item) }
+                                        .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.horizontal)
+                        }
                     }
                 }
-                .padding()
+                .padding(.bottom, 20)
             }
-            .navigationTitle("首页")
+            .background(Color(red: 0.96, green: 0.95, blue: 0.99))
+            .navigationBarHidden(true)
             .task {
                 if store.loggedIn && store.embyItems.isEmpty { await store.loadEmbyItems() }
+            }
+            .sheet(item: $detailItem) { item in
+                ItemDetailView(item: item)
+            }
+            .sheet(isPresented: $showBrowse) {
+                NavigationStack {
+                    ScrollView {
+                        EmbyGrid(items: browseItems).padding()
+                    }
+                    .navigationTitle(browseTitle)
+                    .toolbar { Button("关闭") { showBrowse = false } }
+                }
             }
         }
     }
 }
 
-// MARK: - Library (screenshot style)
+// MARK: - Item detail
+
+struct ItemDetailView: View {
+    @EnvironmentObject var store: Store
+    @Environment(\.dismiss) var dismiss
+    var item: EmbyItem
+    var seriesName: String { item.SeriesName ?? item.Name ?? item.displayName }
+    var episodes: [EmbyItem] {
+        store.embyItems.filter { $0.SeriesName == seriesName }
+            .sorted {
+                if $0.ParentIndexNumber != $1.ParentIndexNumber { return ($0.ParentIndexNumber ?? 0) < ($1.ParentIndexNumber ?? 0) }
+                return ($0.IndexNumber ?? 0) < ($1.IndexNumber ?? 0)
+            }
+    }
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    ZStack(alignment: .bottomLeading) {
+                        if let u = store.backdropURL(for: item) {
+                            AsyncImage(url: u) { img in img.resizable().scaledToFill() } placeholder: {
+                                if let p = store.posterURL(for: item) {
+                                    AsyncImage(url: p) { img in img.resizable().scaledToFill() } placeholder: { Color.gray.opacity(0.2) }
+                                } else { Color.gray.opacity(0.2) }
+                            }
+                        } else if let p = store.posterURL(for: item) {
+                            AsyncImage(url: p) { img in img.resizable().scaledToFill() } placeholder: { Color.gray.opacity(0.2) }
+                        } else {
+                            Color.gray.opacity(0.2)
+                        }
+                    }
+                    .frame(height: 240)
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(item.displayName).font(.title2.bold())
+                        if !item.metaLine.isEmpty { Text(item.metaLine).foregroundStyle(.secondary) }
+                        if let ov = item.Overview, !ov.isEmpty { Text(ov) }
+                        Button {
+                            store.playEmby(item)
+                            dismiss()
+                        } label: {
+                            Label("播放", systemImage: "play.fill")
+                                .font(.headline).foregroundStyle(.white)
+                                .frame(maxWidth: .infinity).padding()
+                                .background(Color.black).clipShape(RoundedRectangle(cornerRadius: 14))
+                        }
+                        if episodes.count > 1 {
+                            Text("选集（\(episodes.count) 集）").font(.headline).padding(.top, 8)
+                            ForEach(episodes) { ep in
+                                Button {
+                                    store.playEmby(ep)
+                                    dismiss()
+                                } label: {
+                                    HStack {
+                                        Text(ep.displayName).foregroundStyle(.black)
+                                        Spacer()
+                                        Image(systemName: "play.circle")
+                                    }
+                                    .padding(.vertical, 8)
+                                }
+                                Divider()
+                            }
+                        }
+                    }
+                    .padding(.horizontal)
+                }
+            }
+            .toolbar { Button("关闭") { dismiss() } }
+        }
+    }
+}
+
+// MARK: - Library (Rex-style server cards)
 
 struct LibraryView: View {
     @EnvironmentObject var store: Store
@@ -748,36 +1037,84 @@ struct LibraryView: View {
     @State private var showEmby = false
     @State private var showIPTV = false
     @State private var showNet = false
+    @State private var editing = false
+
+    var movieCount: Int { store.embyItems.filter { $0.Type == "Movie" }.count }
+    var seriesCount: Int {
+        var seen: [String] = []
+        for item in store.embyItems where item.SeriesName != nil {
+            if !seen.contains(item.SeriesName!) { seen.append(item.SeriesName!) }
+        }
+        return seen.count
+    }
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 20) {
                     HStack {
                         Text("资源库").font(.system(size: 34, weight: .bold))
                         Spacer()
-                        HStack(spacing: 16) {
-                            Image(systemName: "plus").font(.title3)
-                            Image(systemName: "bell.slash").font(.title3)
-                            Image(systemName: "ellipsis").font(.title3)
-                        }
-                        .padding(.horizontal, 18)
-                        .padding(.vertical, 12)
-                        .background(Color.gray.opacity(0.08))
-                        .clipShape(Capsule())
+                        Button(editing ? "完成" : "编辑") { editing.toggle() }
+                            .padding(.horizontal, 18).padding(.vertical, 10)
+                            .background(Color.white).clipShape(Capsule())
+                            .shadow(color: .black.opacity(0.06), radius: 4, y: 2)
                     }
 
-                    LazyVGrid(columns: [GridItem(.flexible(), spacing: 14), GridItem(.flexible())], spacing: 14) {
-                        LibraryCard(title: "Emby 服务器", icon: "server.rack", gradient: [Color.blue.opacity(0.25), Color.purple.opacity(0.15)], foot: store.loggedIn ? "已登录 · \(store.embyItems.count) 部" : "未登录，去设置") {
-                            showEmby = true
+                    Text("媒体服务器").font(.system(size: 15)).foregroundStyle(.gray)
+                    if store.servers.isEmpty {
+                        Text("还没有服务器，去“设置”里登录 Emby，登录后这里会出现服务器卡片。")
+                            .foregroundStyle(.secondary).font(.subheadline)
+                    } else {
+                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 14), GridItem(.flexible())], spacing: 14) {
+                            ForEach(store.servers) { s in
+                                let active = (s.url == store.server && s.username == store.username)
+                                Button {
+                                    if editing {
+                                        if let i = store.servers.firstIndex(where: { $0.id == s.id }) {
+                                            store.servers.remove(at: i); store.saveServers()
+                                        }
+                                    } else {
+                                        store.switchServer(s)
+                                        showEmby = true
+                                    }
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        HStack {
+                                            Image(systemName: editing ? "xmark.circle.fill" : "play.rectangle.fill")
+                                                .font(.title2).foregroundStyle(editing ? .red : .green)
+                                            Spacer()
+                                            Circle().fill(active ? Color.green : Color.gray.opacity(0.3)).frame(width: 8, height: 8)
+                                        }
+                                        Spacer()
+                                        Text(s.name.isEmpty ? s.url : s.name).font(.headline).foregroundStyle(.black).lineLimit(1)
+                                        Text("主线路").font(.footnote).foregroundStyle(.gray)
+                                        if active && store.loggedIn {
+                                            Text("电影:\(movieCount)  剧集:\(seriesCount)").font(.footnote).foregroundStyle(.gray)
+                                        } else {
+                                            Text(active ? "已登录" : "点一下切换").font(.footnote).foregroundStyle(.gray)
+                                        }
+                                    }
+                                    .padding()
+                                    .frame(height: 150)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Color.white)
+                                    .clipShape(RoundedRectangle(cornerRadius: 20))
+                                    .shadow(color: .black.opacity(0.05), radius: 6, y: 2)
+                                }
+                            }
                         }
-                        LibraryCard(title: "IPTV", icon: "tv.fill", gradient: [Color.blue.opacity(0.22), Color.cyan.opacity(0.12)], foot: store.channels.isEmpty ? "未导入列表" : "\(store.channels.count) 个台") {
+                    }
+
+                    Text("其他").font(.system(size: 15)).foregroundStyle(.gray)
+                    LazyVGrid(columns: [GridItem(.flexible(), spacing: 14), GridItem(.flexible())], spacing: 14) {
+                        LibraryCard(title: "IPTV", icon: "tv.fill", foot: store.channels.isEmpty ? "未导入列表" : "\(store.channels.count) 个台") {
                             showIPTV = true
                         }
-                        LibraryCard(title: "相册视频", icon: "photo.on.rectangle", gradient: [Color.yellow.opacity(0.35), Color.orange.opacity(0.12)], foot: "本地文件 · 选文件播放") {
+                        LibraryCard(title: "相册视频", icon: "photo.on.rectangle", foot: "本地文件 · 选文件播放") {
                             showDocPicker = true
                         }
-                        LibraryCard(title: "网络链接", icon: "link", gradient: [Color.blue.opacity(0.18), Color.gray.opacity(0.08)], foot: "粘贴直链播放") {
+                        LibraryCard(title: "网络链接", icon: "link", foot: "粘贴直链播放") {
                             showNet = true
                         }
                     }
@@ -790,6 +1127,7 @@ struct LibraryView: View {
                 }
                 .padding()
             }
+            .background(Color(red: 0.96, green: 0.95, blue: 0.99))
             .navigationBarHidden(true)
             .sheet(isPresented: $showEmby) { EmbyBrowseView() }
             .sheet(isPresented: $showIPTV) { IPTVView() }
@@ -805,7 +1143,6 @@ struct LibraryView: View {
 struct LibraryCard: View {
     var title: String
     var icon: String
-    var gradient: [Color]
     var foot: String
     var action: () -> Void
     var body: some View {
@@ -822,8 +1159,9 @@ struct LibraryCard: View {
             .padding()
             .frame(height: 130)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(LinearGradient(colors: gradient, startPoint: .topLeading, endPoint: .bottomTrailing))
+            .background(Color.white)
             .clipShape(RoundedRectangle(cornerRadius: 20))
+            .shadow(color: .black.opacity(0.05), radius: 6, y: 2)
         }
     }
 }
@@ -855,25 +1193,32 @@ struct EmbyBrowseView: View {
 struct EmbyGrid: View {
     @EnvironmentObject var store: Store
     var items: [EmbyItem]
+    @State private var detailItem: EmbyItem?
     var body: some View {
         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
             ForEach(items) { item in
-                Button { store.playEmby(item) } label: {
+                Button { detailItem = item } label: {
                     VStack(alignment: .leading, spacing: 6) {
-                        if let u = store.posterURL(for: item) {
-                            AsyncImage(url: u) { img in
-                                img.resizable().scaledToFill()
-                            } placeholder: {
-                                Color.gray.opacity(0.15)
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 14).fill(Color.white)
+                            if let u = store.posterURL(for: item) {
+                                AsyncImage(url: u) { img in
+                                    img.resizable().scaledToFill()
+                                } placeholder: {
+                                    VStack { Image(systemName: "photo").foregroundStyle(.gray); Text(item.displayName).font(.caption).foregroundStyle(.gray).lineLimit(2).multilineTextAlignment(.center).padding(4) }
+                                }
                             }
-                            .frame(height: 150)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                        } else {
-                            Color.gray.opacity(0.15).frame(height: 150).clipShape(RoundedRectangle(cornerRadius: 10))
                         }
-                        Text(item.displayName).font(.footnote).lineLimit(2).foregroundStyle(.black)
+                        .frame(height: 165)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                        .shadow(color: .black.opacity(0.06), radius: 4, y: 2)
+                        Text(item.displayName).font(.footnote).lineLimit(1).foregroundStyle(.black)
+                        if let y = item.ProductionYear {
+                            Text("\(y)").font(.caption).foregroundStyle(.gray)
+                        }
                     }
                 }
+                .buttonStyle(.plain)
                 .contextMenu {
                     let title = item.SeriesName ?? item.Name ?? item.displayName
                     Button(store.isFollowing(title) ? "取消追剧" : "追这部剧") {
@@ -881,6 +1226,9 @@ struct EmbyGrid: View {
                     }
                 }
             }
+        }
+        .sheet(item: $detailItem) { item in
+            ItemDetailView(item: item)
         }
     }
 }
@@ -1246,6 +1594,7 @@ struct SettingsView: View {
 
 struct SearchView: View {
     @EnvironmentObject var store: Store
+    @Environment(\.dismiss) var dismiss
     @State private var query = ""
     var iptvHits: [IPTVChannel] {
         query.isEmpty ? [] : store.channels.filter { $0.name.localizedCaseInsensitiveContains(query) }
@@ -1272,6 +1621,7 @@ struct SearchView: View {
                 Task { await store.searchEmby(q) }
             }
             .navigationTitle("搜索")
+            .toolbar { Button("关闭") { dismiss() } }
         }
     }
 }
