@@ -1327,7 +1327,7 @@ struct PlayerView: View {
                     Button("字幕") { trackKind = .subtitle; showTracks = true }
                     Button("导入字幕") { showSubtitlePicker = true }
                     Button("音轨") { trackKind = .audio; showTracks = true }
-                    if store.danmakuServer.isEmpty {
+                    if store.danmuServer.isEmpty {
                         Text("弹幕需在设置里填弹幕服务器地址").font(.footnote).foregroundStyle(.white)
                     } else if store.danmaku.isEmpty {
                         Text("这部没拉到弹幕").font(.footnote).foregroundStyle(.white)
