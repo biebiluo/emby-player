@@ -124,13 +124,29 @@ final class Store: ObservableObject {
     @Published var followNotice = ""
     @Published var subtitles: [SubtitleCue] = []
 
-    @AppStorage("embyServer") var server = ""
-    @AppStorage("danmuServer") var danmuServer = ""
-    @AppStorage("activeProfileId") var activeProfileId = ""
-    @AppStorage("subtitleSize") var subtitleSize = 18.0
-    @AppStorage("aiBaseURL") var aiBaseURL = ""
-    @AppStorage("aiKey") var aiKey = ""
-    @AppStorage("aiModel") var aiModel = ""
+    // 注意：Store 里不能用 @AppStorage，播放页通过 @EnvironmentObject 读它会编不过。
+    // 所以这里全部改成 @Published + UserDefaults 手动存取，效果一样。
+    @Published var server = UserDefaults.standard.string(forKey: "embyServer") ?? "" {
+        didSet { UserDefaults.standard.set(server, forKey: "embyServer") }
+    }
+    @Published var danmuServer = UserDefaults.standard.string(forKey: "danmuServer") ?? "" {
+        didSet { UserDefaults.standard.set(danmuServer, forKey: "danmuServer") }
+    }
+    @Published var activeProfileId = UserDefaults.standard.string(forKey: "activeProfileId") ?? "" {
+        didSet { UserDefaults.standard.set(activeProfileId, forKey: "activeProfileId") }
+    }
+    @Published var subtitleSize = (UserDefaults.standard.object(forKey: "subtitleSize") as? Double) ?? 18.0 {
+        didSet { UserDefaults.standard.set(subtitleSize, forKey: "subtitleSize") }
+    }
+    @Published var aiBaseURL = UserDefaults.standard.string(forKey: "aiBaseURL") ?? "" {
+        didSet { UserDefaults.standard.set(aiBaseURL, forKey: "aiBaseURL") }
+    }
+    @Published var aiKey = UserDefaults.standard.string(forKey: "aiKey") ?? "" {
+        didSet { UserDefaults.standard.set(aiKey, forKey: "aiKey") }
+    }
+    @Published var aiModel = UserDefaults.standard.string(forKey: "aiModel") ?? "" {
+        didSet { UserDefaults.standard.set(aiModel, forKey: "aiModel") }
+    }
 
     var activeProfileName: String {
         profiles.first { $0.id.uuidString == activeProfileId }?.name ?? profiles.first?.name ?? "我"
@@ -220,11 +236,21 @@ final class Store: ObservableObject {
         }
         saveFollowed()
     }
-    @AppStorage("embyUser") var username = ""
-    @AppStorage("embyToken") var token = ""
-    @AppStorage("embyUserId") var userId = ""
-    @AppStorage("iptvURL") var iptvURL = ""
-    @AppStorage("netURL") var netURL = ""
+    @Published var username = UserDefaults.standard.string(forKey: "embyUser") ?? "" {
+        didSet { UserDefaults.standard.set(username, forKey: "embyUser") }
+    }
+    @Published var token = UserDefaults.standard.string(forKey: "embyToken") ?? "" {
+        didSet { UserDefaults.standard.set(token, forKey: "embyToken") }
+    }
+    @Published var userId = UserDefaults.standard.string(forKey: "embyUserId") ?? "" {
+        didSet { UserDefaults.standard.set(userId, forKey: "embyUserId") }
+    }
+    @Published var iptvURL = UserDefaults.standard.string(forKey: "iptvURL") ?? "" {
+        didSet { UserDefaults.standard.set(iptvURL, forKey: "iptvURL") }
+    }
+    @Published var netURL = UserDefaults.standard.string(forKey: "netURL") ?? "" {
+        didSet { UserDefaults.standard.set(netURL, forKey: "netURL") }
+    }
 
     var loggedIn: Bool { !token.isEmpty && !userId.isEmpty }
     var cleanServer: String { server.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/")) }
